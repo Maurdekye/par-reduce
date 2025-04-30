@@ -1,6 +1,9 @@
 #![feature(mpmc_channel)]
 use std::{
-    sync::{atomic::{AtomicBool, AtomicUsize, Ordering}, mpmc::channel},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpmc::channel,
+    },
     thread::{self, available_parallelism},
 };
 
@@ -10,43 +13,35 @@ where
     I::Item: Send + Sync,
     F: Fn(I::Item, I::Item) -> I::Item + Send + Sync,
 {
-    let in_flight = AtomicUsize::new(0);
     let work_finished = AtomicBool::new(false);
     thread::scope(|scope| {
         let (outbox, inbox) = channel();
         let num_cpus: usize = available_parallelism().map(usize::from).unwrap_or(1);
+        dbg!(num_cpus);
         let workers: Vec<_> = (0..num_cpus)
             .map(|_| {
                 let inbox = inbox.clone();
                 let outbox = outbox.clone();
                 let f = &f;
-                let in_flight = &in_flight;
                 let work_finished = &work_finished;
                 scope.spawn(move || {
                     let mut stock = None;
-                    while let Some(elem) = inbox.recv().unwrap() {
-                        stock = match stock {
-                            Some(other) => {
-                                outbox.send(Some(f(elem, other))).unwrap();
-                                None
-                            }
-                            None => Some(elem),
-                        };
-                        let in_flight = in_flight.fetch_sub(1, Ordering::SeqCst);
-                        let work_finished = work_finished.load(Ordering::SeqCst);
-                        if work_finished && in_flight <= 1 {
-                            (1..num_cpus).for_each(|_| outbox.send(None).unwrap());
-                            break;
+                    while !work_finished.load(Ordering::SeqCst) {
+                        while let Ok(Some(elem)) = inbox.try_recv() {
+                            stock = match stock {
+                                Some(other) => {
+                                    outbox.send(Some(f(elem, other))).unwrap();
+                                    None
+                                }
+                                None => Some(elem),
+                            };
                         }
                     }
                     stock
                 })
             })
             .collect();
-        it.for_each(|elem| {
-            in_flight.fetch_add(1, Ordering::SeqCst);
-            outbox.send(Some(elem)).unwrap()
-        });
+        it.for_each(|elem| outbox.send(Some(elem)).unwrap());
         work_finished.store(true, Ordering::SeqCst);
         drop((inbox, outbox));
         workers
@@ -96,4 +91,12 @@ fn test() {
         .par_reduce(|a, b| (a.0 + b.0, a.1 + b.1))
         .unwrap();
     assert_eq!(sums, (0 + 5 + 16 + 8, 1 + 6 + 2 + 9));
+}
+
+#[test]
+fn test_against_naive_reduce() {
+    let vals: Vec<_> = (0..10000).map(|x: usize| x.pow(3) % 100).collect();
+    let simple_reduce = vals.iter().copied().reduce(|a, b| a + b);
+    let par_reduce = vals.iter().copied().par_reduce(|a, b| a + b);
+    assert_eq!(simple_reduce, par_reduce);
 }
